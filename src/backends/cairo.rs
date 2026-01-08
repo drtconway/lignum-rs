@@ -515,8 +515,65 @@ impl CanvasPaths for CairoCanvas {
         Ok(())
     }
 
-    fn arc_to(&mut self, _x1: f64, _y1: f64, _x2: f64, _y2: f64, _radius: f64) -> Result<()> {
-        todo!("arc_to is not implemented for Cairo backend yet");
+    fn arc_to(&mut self, x1: f64, y1: f64, x2: f64, y2: f64, radius: f64) -> Result<()> {
+        let (x0, y0) = self.ctx.current_point()?;
+        let r = radius;
+
+        // Degenerate cases: treat as straight segments.
+        if r == 0.0
+            || ((x0 - x1).abs() < 1e-9 && (y0 - y1).abs() < 1e-9)
+            || ((x1 - x2).abs() < 1e-9 && (y1 - y2).abs() < 1e-9)
+        {
+            self.line_to(x1, y1)?;
+            return Ok(());
+        }
+
+        let v1 = (x0 - x1, y0 - y1);
+        let v2 = (x2 - x1, y2 - y1);
+        let len1 = (v1.0 * v1.0 + v1.1 * v1.1).sqrt();
+        let len2 = (v2.0 * v2.0 + v2.1 * v2.1).sqrt();
+        if len1 < 1e-9 || len2 < 1e-9 {
+            self.line_to(x1, y1)?;
+            return Ok(());
+        }
+
+        let v1n = (v1.0 / len1, v1.1 / len1);
+        let v2n = (v2.0 / len2, v2.1 / len2);
+        let dot = (v1n.0 * v2n.0 + v1n.1 * v2n.1).clamp(-1.0, 1.0);
+
+        // Collinear: draw straight.
+        if (1.0 - dot).abs() < 1e-6 || (1.0 + dot).abs() < 1e-6 {
+            self.line_to(x1, y1)?;
+            return Ok(());
+        }
+
+        let angle = dot.acos();
+        let tan_half = (angle / 2.0).tan();
+        if tan_half.abs() < 1e-9 {
+            self.line_to(x1, y1)?;
+            return Ok(());
+        }
+        let dist = r / tan_half;
+
+        let tp1 = (x1 + v1n.0 * dist, y1 + v1n.1 * dist);
+        let tp2 = (x1 + v2n.0 * dist, y1 + v2n.1 * dist);
+
+        let cross = v1n.0 * v2n.1 - v1n.1 * v2n.0;
+        let mut n1 = (-v1n.1, v1n.0);
+        if cross < 0.0 {
+            n1 = (v1n.1, -v1n.0);
+        }
+        let center = (tp1.0 + n1.0 * r, tp1.1 + n1.1 * r);
+        let start_ang = (tp1.1 - center.1).atan2(tp1.0 - center.0);
+        let end_ang = (tp2.1 - center.1).atan2(tp2.0 - center.0);
+
+        self.line_to(tp1.0, tp1.1)?;
+        if cross > 0.0 {
+            self.ctx.arc(center.0, center.1, r, start_ang, end_ang);
+        } else {
+            self.ctx.arc_negative(center.0, center.1, r, start_ang, end_ang);
+        }
+        Ok(())
     }
 
     fn ellipse(

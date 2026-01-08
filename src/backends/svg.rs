@@ -27,6 +27,8 @@ pub struct SvgCanvas<W: Write> {
     #[allow(dead_code)]
     height: f64,
     current_path: String,
+    current_point: Option<(f64, f64)>,
+    subpath_start: Option<(f64, f64)>,
     state: SvgState,
     stack: Vec<SvgState>,
     gradient_counter: usize,
@@ -58,6 +60,8 @@ impl<W: Write> SvgCanvas<W> {
             width,
             height,
             current_path: String::new(),
+            current_point: None,
+            subpath_start: None,
             state: SvgState::default(),
             stack: Vec::new(),
             gradient_counter: 0,
@@ -305,6 +309,76 @@ impl<W: Write> SvgCanvas<W> {
             self.current_path.push(' ');
         }
         self.current_path.push_str(cmd);
+    }
+
+    fn set_current_point(&mut self, x: f64, y: f64) {
+        self.current_point = Some((x, y));
+    }
+
+    fn ensure_subpath(&mut self) -> Result<()> {
+        if self.current_point.is_none() {
+            self.move_to(0.0, 0.0)?;
+        }
+        Ok(())
+    }
+
+    fn append_arc_segments(
+        &mut self,
+        cx: f64,
+        cy: f64,
+        radius: f64,
+        start_angle: f64,
+        end_angle: f64,
+        ccw: bool,
+    ) -> Result<()> {
+        let tau = std::f64::consts::PI * 2.0;
+        let mut delta = end_angle - start_angle;
+        if !ccw {
+            while delta < 0.0 {
+                delta += tau;
+            }
+        } else {
+            while delta > 0.0 {
+                delta -= tau;
+            }
+        }
+
+        if delta.abs() < 1e-12 {
+            return Ok(());
+        }
+
+        let mut remaining = delta;
+        let mut current_angle = start_angle;
+        let max_step = std::f64::consts::PI; // keep segments <= 180deg to avoid degenerate arcs
+
+        while remaining.abs() > 1e-12 {
+            let step = if remaining.abs() > max_step {
+                max_step.copysign(remaining)
+            } else {
+                remaining
+            };
+
+            let next_angle = current_angle + step;
+            let end_x = cx + radius * next_angle.cos();
+            let end_y = cy + radius * next_angle.sin();
+            let large_arc = if step.abs() >= std::f64::consts::PI - 1e-9 {
+                1
+            } else {
+                0
+            };
+            let sweep_flag = if step >= 0.0 { 1 } else { 0 };
+
+            self.push_path(&format!(
+                "A {} {} 0 {} {} {} {}",
+                radius, radius, large_arc, sweep_flag, end_x, end_y
+            ));
+            self.set_current_point(end_x, end_y);
+
+            current_angle = next_angle;
+            remaining -= step;
+        }
+
+        Ok(())
     }
 
     fn apply_transform_attr(&self, elem: &mut BytesStart<'_>) {
@@ -683,21 +757,32 @@ impl<W: Write> CanvasRectangles for SvgCanvas<W> {
 impl<W: Write> CanvasPaths for SvgCanvas<W> {
     fn begin_path(&mut self) -> Result<()> {
         self.current_path.clear();
+        self.current_point = None;
+        self.subpath_start = None;
         Ok(())
     }
 
     fn close_path(&mut self) -> Result<()> {
         self.push_path("Z");
+        if let Some(start) = self.subpath_start {
+            self.set_current_point(start.0, start.1);
+        }
         Ok(())
     }
 
     fn move_to(&mut self, x: f64, y: f64) -> Result<()> {
         self.push_path(&format!("M {} {}", x, y));
+        self.subpath_start = Some((x, y));
+        self.set_current_point(x, y);
         Ok(())
     }
 
     fn line_to(&mut self, x: f64, y: f64) -> Result<()> {
+        if self.current_point.is_none() {
+            self.move_to(0.0, 0.0)?;
+        }
         self.push_path(&format!("L {} {}", x, y));
+        self.set_current_point(x, y);
         Ok(())
     }
 
@@ -710,32 +795,105 @@ impl<W: Write> CanvasPaths for SvgCanvas<W> {
         x: f64,
         y: f64,
     ) -> Result<()> {
+        self.ensure_subpath()?;
         self.push_path(&format!(
             "C {} {}, {} {}, {} {}",
             cp1x, cp1y, cp2x, cp2y, x, y
         ));
+        self.set_current_point(x, y);
         Ok(())
     }
 
     fn quadratic_curve_to(&mut self, cpx: f64, cpy: f64, x: f64, y: f64) -> Result<()> {
+        self.ensure_subpath()?;
         self.push_path(&format!("Q {} {}, {} {}", cpx, cpy, x, y));
+        self.set_current_point(x, y);
         Ok(())
     }
 
     fn arc(
         &mut self,
-        _x: f64,
-        _y: f64,
-        _radius: f64,
-        _start_angle: f64,
-        _end_angle: f64,
-        _ccw: bool,
+        x: f64,
+        y: f64,
+        radius: f64,
+        start_angle: f64,
+        end_angle: f64,
+        ccw: bool,
     ) -> Result<()> {
-        Err(Self::not_supported("arc"))
+        if radius <= 0.0 {
+            return Ok(());
+        }
+
+        let start_x = x + radius * start_angle.cos();
+        let start_y = y + radius * start_angle.sin();
+
+        match self.current_point {
+            Some((px, py)) => {
+                if (px - start_x).abs() > 1e-9 || (py - start_y).abs() > 1e-9 {
+                    self.line_to(start_x, start_y)?;
+                }
+            }
+            None => {
+                self.move_to(start_x, start_y)?;
+            }
+        }
+
+        self.append_arc_segments(x, y, radius, start_angle, end_angle, ccw)
     }
 
-    fn arc_to(&mut self, _x1: f64, _y1: f64, _x2: f64, _y2: f64, _radius: f64) -> Result<()> {
-        Err(Self::not_supported("arc_to"))
+    fn arc_to(&mut self, x1: f64, y1: f64, x2: f64, y2: f64, radius: f64) -> Result<()> {
+        let (x0, y0) = match self.current_point {
+            Some(p) => p,
+            None => {
+                self.move_to(x1, y1)?;
+                return Ok(());
+            }
+        };
+
+        if radius == 0.0
+            || ((x0 - x1).abs() < 1e-9 && (y0 - y1).abs() < 1e-9)
+            || ((x1 - x2).abs() < 1e-9 && (y1 - y2).abs() < 1e-9)
+        {
+            return self.line_to(x1, y1);
+        }
+
+        let v1 = (x0 - x1, y0 - y1);
+        let v2 = (x2 - x1, y2 - y1);
+        let len1 = (v1.0 * v1.0 + v1.1 * v1.1).sqrt();
+        let len2 = (v2.0 * v2.0 + v2.1 * v2.1).sqrt();
+        if len1 < 1e-9 || len2 < 1e-9 {
+            return self.line_to(x1, y1);
+        }
+
+        let v1n = (v1.0 / len1, v1.1 / len1);
+        let v2n = (v2.0 / len2, v2.1 / len2);
+        let dot = (v1n.0 * v2n.0 + v1n.1 * v2n.1).clamp(-1.0, 1.0);
+
+        if (1.0 - dot).abs() < 1e-6 || (1.0 + dot).abs() < 1e-6 {
+            return self.line_to(x1, y1);
+        }
+
+        let angle = dot.acos();
+        let tan_half = (angle / 2.0).tan();
+        if tan_half.abs() < 1e-9 {
+            return self.line_to(x1, y1);
+        }
+        let dist = radius / tan_half;
+
+        let tp1 = (x1 + v1n.0 * dist, y1 + v1n.1 * dist);
+        let tp2 = (x1 + v2n.0 * dist, y1 + v2n.1 * dist);
+
+        let cross = v1n.0 * v2n.1 - v1n.1 * v2n.0;
+        let mut n1 = (-v1n.1, v1n.0);
+        if cross < 0.0 {
+            n1 = (v1n.1, -v1n.0);
+        }
+        let center = (tp1.0 + n1.0 * radius, tp1.1 + n1.1 * radius);
+        let start_ang = (tp1.1 - center.1).atan2(tp1.0 - center.0);
+        let end_ang = (tp2.1 - center.1).atan2(tp2.0 - center.0);
+
+        self.line_to(tp1.0, tp1.1)?;
+        self.append_arc_segments(center.0, center.1, radius, start_ang, end_ang, cross < 0.0)
     }
 
     fn ellipse(
@@ -768,6 +926,8 @@ impl<W: Write> CanvasPaths for SvgCanvas<W> {
 
     fn rect(&mut self, x: f64, y: f64, w: f64, h: f64) -> Result<()> {
         self.push_path(&format!("M {} {} h {} v {} h {} Z", x, y, w, h, -w));
+        self.subpath_start = Some((x, y));
+        self.set_current_point(x, y);
         Ok(())
     }
 
