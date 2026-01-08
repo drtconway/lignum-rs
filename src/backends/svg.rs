@@ -29,6 +29,7 @@ pub struct SvgCanvas<W: Write> {
     current_path: String,
     current_point: Option<(f64, f64)>,
     subpath_start: Option<(f64, f64)>,
+    clip_counter: usize,
     state: SvgState,
     stack: Vec<SvgState>,
     gradient_counter: usize,
@@ -62,6 +63,7 @@ impl<W: Write> SvgCanvas<W> {
             current_path: String::new(),
             current_point: None,
             subpath_start: None,
+            clip_counter: 0,
             state: SvgState::default(),
             stack: Vec::new(),
             gradient_counter: 0,
@@ -95,6 +97,12 @@ impl<W: Write> SvgCanvas<W> {
             Paint::Color(c) => Ok(c.clone()),
             Paint::Gradient(g) => self.gradient_paint(g),
             Paint::Pattern(p) => self.pattern_paint(p),
+        }
+    }
+
+    fn apply_clip_attr(&self, elem: &mut BytesStart<'_>) {
+        if let Some(ref clip) = self.state.clip_path {
+            elem.push_attribute(("clip-path", clip.as_str()));
         }
     }
 
@@ -211,6 +219,40 @@ impl<W: Write> SvgCanvas<W> {
         Ok(())
     }
 
+        fn write_clip_path_def(
+            &mut self,
+            id: &str,
+            d: &str,
+            transform: Option<[f64; 6]>,
+            rule: FillRule,
+        ) -> Result<()> {
+            self.writer
+                .write_event(Event::Start(BytesStart::new("defs")))?;
+
+            let mut clip = BytesStart::new("clipPath");
+            clip.push_attribute(("id", id));
+            self.writer.write_event(Event::Start(clip))?;
+
+            let mut path = BytesStart::new("path");
+            path.push_attribute(("d", d));
+            path.push_attribute((
+                "clip-rule",
+                match rule {
+                    FillRule::NonZero => "nonzero",
+                    FillRule::EvenOdd => "evenodd",
+                },
+            ));
+            if let Some([a, b, c, d_val, e, f]) = transform {
+                let transform_attr = format!("matrix({} {} {} {} {} {})", a, b, c, d_val, e, f);
+                path.push_attribute(("transform", transform_attr.as_str()));
+            }
+            self.writer.write_event(Event::Empty(path))?;
+
+            self.writer.write_event(Event::End(BytesEnd::new("clipPath")))?;
+            self.writer.write_event(Event::End(BytesEnd::new("defs")))?;
+            Ok(())
+        }
+
     fn encode_image_as_data_uri(&self, image: &dyn CanvasImageSource) -> Result<String> {
         let width = image.width();
         let height = image.height();
@@ -251,6 +293,7 @@ impl<W: Write> SvgCanvas<W> {
             elem.push_attribute(("opacity", opacity_attr.as_str()));
         }
         self.apply_transform_attr(&mut elem);
+        self.apply_clip_attr(&mut elem);
         self.write_empty(elem)
     }
 
@@ -301,6 +344,7 @@ impl<W: Write> SvgCanvas<W> {
             elem.push_attribute(("stroke-dashoffset", dash_offset_attr.as_str()));
         }
         self.apply_transform_attr(&mut elem);
+        self.apply_clip_attr(&mut elem);
         self.write_empty(elem)
     }
 
@@ -426,6 +470,7 @@ struct SvgState {
     text_baseline: TextBaseline,
     direction: Direction,
     transform: [f64; 6],
+    clip_path: Option<String>,
 }
 
 impl Default for SvgState {
@@ -452,6 +497,7 @@ impl Default for SvgState {
             text_baseline: TextBaseline::Alphabetic,
             direction: Direction::Inherit,
             transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            clip_path: None,
         }
     }
 }
@@ -729,6 +775,7 @@ impl<W: Write> CanvasRectangles for SvgCanvas<W> {
             elem.push_attribute(("opacity", opacity_attr.as_str()));
         }
         self.apply_transform_attr(&mut elem);
+        self.apply_clip_attr(&mut elem);
         self.write_empty(elem)
     }
 
@@ -750,6 +797,7 @@ impl<W: Write> CanvasRectangles for SvgCanvas<W> {
         elem.push_attribute(("stroke", stroke.as_str()));
         elem.push_attribute(("stroke-width", stroke_width_attr.as_str()));
         self.apply_transform_attr(&mut elem);
+        self.apply_clip_attr(&mut elem);
         self.write_empty(elem)
     }
 }
@@ -921,6 +969,7 @@ impl<W: Write> CanvasPaths for SvgCanvas<W> {
         elem.push_attribute(("ry", ry_attr.as_str()));
         elem.push_attribute(("fill", fill.as_str()));
         self.apply_transform_attr(&mut elem);
+        self.apply_clip_attr(&mut elem);
         self.write_empty(elem)
     }
 
@@ -931,8 +980,67 @@ impl<W: Write> CanvasPaths for SvgCanvas<W> {
         Ok(())
     }
 
-    fn round_rect(&mut self, _x: f64, _y: f64, _w: f64, _h: f64, _radii: &[f64]) -> Result<()> {
-        Err(Self::not_supported("round_rect"))
+    fn round_rect(&mut self, x: f64, y: f64, w: f64, h: f64, radii: &[f64]) -> Result<()> {
+        let mut corner = [0.0; 4];
+        match radii.len() {
+            0 => {}
+            1 => corner.fill(radii[0]),
+            2 => {
+                corner[0] = radii[0];
+                corner[1] = radii[1];
+                corner[2] = radii[0];
+                corner[3] = radii[1];
+            }
+            3 => {
+                corner[0] = radii[0];
+                corner[1] = radii[1];
+                corner[2] = radii[2];
+                corner[3] = radii[1];
+            }
+            _ => {
+                corner[0] = radii[0];
+                corner[1] = radii[1];
+                corner[2] = radii[2];
+                corner[3] = radii[3];
+            }
+        }
+
+        let limit = (w.abs() / 2.0).min(h.abs() / 2.0);
+        for r in &mut corner {
+            if *r < 0.0 {
+                *r = 0.0;
+            }
+            if *r > limit {
+                *r = limit;
+            }
+        }
+
+        let (tl, tr, br, bl) = (corner[0], corner[1], corner[2], corner[3]);
+        let right = x + w;
+        let bottom = y + h;
+
+        self.move_to(x + tl, y)?;
+        self.line_to(right - tr, y)?;
+        if tr > 0.0 {
+            self.push_path(&format!("A {} {} 0 0 1 {} {}", tr, tr, right, y + tr));
+            self.set_current_point(right, y + tr);
+        }
+        self.line_to(right, bottom - br)?;
+        if br > 0.0 {
+            self.push_path(&format!("A {} {} 0 0 1 {} {}", br, br, right - br, bottom));
+            self.set_current_point(right - br, bottom);
+        }
+        self.line_to(x + bl, bottom)?;
+        if bl > 0.0 {
+            self.push_path(&format!("A {} {} 0 0 1 {} {}", bl, bl, x, bottom - bl));
+            self.set_current_point(x, bottom - bl);
+        }
+        self.line_to(x, y + tl)?;
+        if tl > 0.0 {
+            self.push_path(&format!("A {} {} 0 0 1 {} {}", tl, tl, x + tl, y));
+            self.set_current_point(x + tl, y);
+        }
+        self.close_path()
     }
 
     fn fill(&mut self, fill_rule: FillRule) -> Result<()> {
@@ -943,8 +1051,23 @@ impl<W: Write> CanvasPaths for SvgCanvas<W> {
         self.flush_path_stroke()
     }
 
-    fn clip(&mut self, _fill_rule: FillRule) -> Result<()> {
-        Err(Self::not_supported("clip"))
+    fn clip(&mut self, fill_rule: FillRule) -> Result<()> {
+        if self.current_path.is_empty() {
+            return Ok(());
+        }
+
+        let id = format!("clip{}", self.clip_counter);
+        self.clip_counter += 1;
+
+        let transform = self.state.transform;
+        let path_d = self.current_path.clone();
+        self.write_clip_path_def(&id, path_d.as_str(), Some(transform), fill_rule)?;
+        self.state.clip_path = Some(format!("url(#{})", id));
+
+        self.current_path.clear();
+        self.current_point = None;
+        self.subpath_start = None;
+        Ok(())
     }
 
     fn is_point_in_path(&self, _x: f64, _y: f64, _opts: HitOptions) -> Result<bool> {
@@ -1023,6 +1146,7 @@ impl<W: Write> CanvasText for SvgCanvas<W> {
             },
         ));
         self.apply_transform_attr(&mut elem);
+        self.apply_clip_attr(&mut elem);
         self.writer.write_event(Event::Start(elem))?;
         self.writer.write_event(Event::Text(BytesText::new(text)))?;
         self.writer.write_event(Event::End(BytesEnd::new("text")))?;
@@ -1085,6 +1209,7 @@ impl<W: Write> CanvasDrawImage for SvgCanvas<W> {
         elem.push_attribute(("height", h_attr.as_str()));
         elem.push_attribute(("href", href.as_str()));
         self.apply_transform_attr(&mut elem);
+        self.apply_clip_attr(&mut elem);
         self.write_empty(elem)
     }
 
@@ -1109,6 +1234,7 @@ impl<W: Write> CanvasDrawImage for SvgCanvas<W> {
         elem.push_attribute(("href", href.as_str()));
         elem.push_attribute(("preserveAspectRatio", "none"));
         self.apply_transform_attr(&mut elem);
+        self.apply_clip_attr(&mut elem);
         self.write_empty(elem)
     }
 
@@ -1196,6 +1322,17 @@ mod tests {
 
         assert!(out.contains("<pattern id=\"pat0\""));
         assert!(out.contains("fill=\"url(#pat0)\""));
+    }
+
+    #[test]
+    fn writes_round_rect_path() {
+        let out = svg_output(|svg| {
+            svg.begin_path()?;
+            svg.round_rect(0.0, 0.0, 10.0, 8.0, &[2.0])?;
+            svg.fill(FillRule::NonZero)
+        });
+
+        assert!(out.contains("d=\"M 2 0 L 8 0 A 2 2 0 0 1 10 2 L 10 6 A 2 2 0 0 1 8 8 L 2 8 A 2 2 0 0 1 0 6 L 0 2 A 2 2 0 0 1 2 0 Z\""));
     }
 
     #[test]
