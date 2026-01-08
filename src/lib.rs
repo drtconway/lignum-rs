@@ -4,8 +4,4 @@
 
 pub mod api;
 pub mod error;
-
-
-#[cfg(feature = "cairo")]
-pub mod cairo_backend;
-
+pub mod backends;
