@@ -353,7 +353,27 @@ pub trait CanvasDrawImage {
 
 pub trait CanvasPathDrawingStyles: CanvasLineStyles + CanvasFillStrokeStyles {}
 
-pub trait CanvasImageSource {}
+pub trait CanvasImageSource {
+    fn width(&self) -> u32;
+    fn height(&self) -> u32;
+    /// Returns a view over RGBA pixels (premultiplied or straight alpha depending on backend expectations).
+    /// Length must be width * height * 4.
+    fn data_rgba(&self) -> Option<&[u8]>;
+}
+
+impl CanvasImageSource for ImageData {
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    fn data_rgba(&self) -> Option<&[u8]> {
+        Some(self.data.as_slice())
+    }
+}
 
 pub trait CanvasRenderingContext2D:
     CanvasState

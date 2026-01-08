@@ -37,3 +37,17 @@ impl From<cairo::Error> for LignumError {
         LignumError::Backend(Box::new(err))
     }
 }
+
+#[cfg(feature = "svg")]
+impl From<quick_xml::Error> for LignumError {
+    fn from(err: quick_xml::Error) -> Self {
+        LignumError::Backend(Box::new(err))
+    }
+}
+
+#[cfg(feature = "svg")]
+impl From<png::EncodingError> for LignumError {
+    fn from(err: png::EncodingError) -> Self {
+        LignumError::Backend(Box::new(err))
+    }
+}

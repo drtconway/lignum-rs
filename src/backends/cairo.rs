@@ -4,12 +4,12 @@
 //! directly (shadows, image smoothing toggles, patterns, image data upload).
 
 use cairo::{
-    Context, FillRule as CairoFillRule, LineCap as CairoLineCap, LineJoin as CairoLineJoin,
-    Operator,
+    Context, Extend, FillRule as CairoFillRule, Format, ImageSurface, LineCap as CairoLineCap, LineJoin as CairoLineJoin,
+    Operator, SurfacePattern, Filter,
 };
 
 use crate::api::*;
-use crate::error::Result;
+use crate::error::{Result, LignumError};
 
 /// Adapter that translates CanvasRenderingContext2D calls into Cairo operations.
 pub struct CairoCanvas {
@@ -195,6 +195,71 @@ impl CanvasTransforms for CairoCanvas {
     fn reset_transform(&mut self) -> Result<()> {
         self.ctx.identity_matrix();
         Ok(())
+    }
+}
+
+impl CairoCanvas {
+    fn image_surface_from_rgba(&self, image: &dyn CanvasImageSource) -> Result<ImageSurface> {
+        let width = image.width();
+        let height = image.height();
+        let data = image
+            .data_rgba()
+            .ok_or_else(|| LignumError::Other(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "CanvasImageSource missing RGBA data",
+            ))))?;
+
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|v| v.checked_mul(4))
+            .ok_or_else(|| LignumError::Other(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "image dimensions overflow",
+            ))))?;
+
+        if data.len() != expected {
+            return Err(LignumError::Other(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "RGBA buffer length does not match width*height*4",
+            ))));
+        }
+
+        let mut buf = vec![0u8; expected];
+        for (i, chunk) in data.chunks_exact(4).enumerate() {
+            let r = chunk[0] as u16;
+            let g = chunk[1] as u16;
+            let b = chunk[2] as u16;
+            let a = chunk[3] as u16;
+            let pr = (r * a + 127) / 255;
+            let pg = (g * a + 127) / 255;
+            let pb = (b * a + 127) / 255;
+            let idx = i * 4;
+            // Cairo ARgb32 expects premultiplied alpha with native-endian (BGRA on little-endian).
+            buf[idx] = pb as u8;
+            buf[idx + 1] = pg as u8;
+            buf[idx + 2] = pr as u8;
+            buf[idx + 3] = a as u8;
+        }
+
+        let stride = (width * 4) as i32;
+        let surface = ImageSurface::create_for_data(buf, Format::ARgb32, width as i32, height as i32, stride)?;
+        Ok(surface)
+    }
+
+    fn make_image_pattern(&self, surface: &ImageSurface) -> SurfacePattern {
+        let pattern = SurfacePattern::create(surface);
+        let filter = if !self.image_smoothing_enabled {
+            Filter::Nearest
+        } else {
+            match self.image_smoothing_quality {
+                ImageSmoothingQuality::Low => Filter::Fast,
+                ImageSmoothingQuality::Medium => Filter::Good,
+                ImageSmoothingQuality::High => Filter::Best,
+            }
+        };
+        pattern.set_filter(filter);
+        pattern.set_extend(Extend::None);
+        pattern
     }
 }
 
@@ -654,8 +719,18 @@ impl CanvasImageData for CairoCanvas {
 }
 
 impl CanvasDrawImage for CairoCanvas {
-    fn draw_image(&mut self, _image: &dyn CanvasImageSource, _dx: f64, _dy: f64) -> Result<()> {
-        todo!("draw_image requires a concrete CanvasImageSource for Cairo");
+    fn draw_image(&mut self, image: &dyn CanvasImageSource, dx: f64, dy: f64) -> Result<()> {
+        let surface = self.image_surface_from_rgba(image)?;
+        let pattern = self.make_image_pattern(&surface);
+
+        self.ctx.save()?;
+        self.apply_composite();
+        self.ctx.set_source(&pattern)?;
+        self.ctx.rectangle(dx, dy, image.width() as f64, image.height() as f64);
+        self.ctx.clip();
+        self.ctx.paint_with_alpha(self.global_alpha)?;
+        self.ctx.restore()?;
+        Ok(())
     }
 
     fn draw_image_scaled(
@@ -666,22 +741,51 @@ impl CanvasDrawImage for CairoCanvas {
         dw: f64,
         dh: f64,
     ) -> Result<()> {
-        self.draw_image_subrect(image, 0.0, 0.0, dw, dh, dx, dy, dw, dh)
+        let surface = self.image_surface_from_rgba(image)?;
+        let pattern = self.make_image_pattern(&surface);
+        let scale_x = dw / image.width() as f64;
+        let scale_y = dh / image.height() as f64;
+
+        self.ctx.save()?;
+        self.apply_composite();
+        self.ctx.translate(dx, dy);
+        self.ctx.scale(scale_x, scale_y);
+        self.ctx.set_source(&pattern)?;
+        self.ctx.rectangle(0.0, 0.0, image.width() as f64, image.height() as f64);
+        self.ctx.clip();
+        self.ctx.paint_with_alpha(self.global_alpha)?;
+        self.ctx.restore()?;
+        Ok(())
     }
 
     fn draw_image_subrect(
         &mut self,
-        _image: &dyn CanvasImageSource,
-        _sx: f64,
-        _sy: f64,
-        _sw: f64,
-        _sh: f64,
-        _dx: f64,
-        _dy: f64,
-        _dw: f64,
-        _dh: f64,
+        image: &dyn CanvasImageSource,
+        sx: f64,
+        sy: f64,
+        sw: f64,
+        sh: f64,
+        dx: f64,
+        dy: f64,
+        dw: f64,
+        dh: f64,
     ) -> Result<()> {
-        todo!("draw_image_subrect requires a concrete CanvasImageSource for Cairo");
+        let surface = self.image_surface_from_rgba(image)?;
+        let pattern = self.make_image_pattern(&surface);
+        let scale_x = dw / sw;
+        let scale_y = dh / sh;
+
+        self.ctx.save()?;
+        self.apply_composite();
+        self.ctx.rectangle(dx, dy, dw, dh);
+        self.ctx.clip();
+        self.ctx.translate(dx, dy);
+        self.ctx.scale(scale_x, scale_y);
+        self.ctx.translate(-sx, -sy);
+        self.ctx.set_source(&pattern)?;
+        self.ctx.paint_with_alpha(self.global_alpha)?;
+        self.ctx.restore()?;
+        Ok(())
     }
 }
 
