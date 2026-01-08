@@ -1,10 +1,10 @@
 [package]
-name = "lignum-rs"
+name = "lignum"
 version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["cairo", "svg"]
+default = []
 cairo = ["dep:cairo-rs"]
 svg = ["dep:quick-xml", "dep:png", "dep:base64"]
 
