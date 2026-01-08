@@ -3,4 +3,9 @@ name = "lignum-rs"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["cairo"]
+cairo = ["dep:cairo-rs"]
+
 [dependencies]
+cairo-rs = { version = "0.21.5", optional = true }
